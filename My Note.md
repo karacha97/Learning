@@ -603,7 +603,140 @@ int dup2(int fildes, int fildes2);
 	fclose(readfp);
 ```
 ## 5. 优于`select`的`epoll`
+select函数虽然好用，但是也是有缺陷：
 
+- 每次调用都要把所有文件描述符循环地检测一遍，好麻烦；
+- 每次调用都要传递监视对象信息。select调用后会吧fd_set结构体改变，发生变化的文件描述符置1，其余的置0，因此还需要每次保存副本；
+
+^我们希望的是什么样的呢？只用传递1此监视对象，发生变化时只通知发生变化的就好^
+
+### 5.1 epoll基本原理
+epoll需要基于以下几个函数：
+- epoll_create:创建保存epoll文件描述符的空间
+- epoll_ctl: 向空间注册并注销文件描述符
+- epoll_wait:类似与select，等待发生变化
+
+select中通过fd_set来检测文件描述符，而epoll中通过epoll_event结构体来发生变化的文件描述符集中在一起；
+```
+struct epoll_event{
+	__uint32_t events;
+	epoll_data_t data;
+}
+
+typedef union epoll_data{
+	void *ptr;
+	int fd;
+	__uint32_t u32;
+	__uint64_t  u64
+}epoll_data_t
+```
+^union: 共用体：共用体可以有多个数据成员，但是在任意时刻只能有一个有值^
+
+```
+int epoll_create(int size);
+```
+请求OS创建保存文件描述符的空间；一般来讲会向其传入请求开辟的空间的大小，但是实际上只是请求。
+
+```
+int epoll_ctl(int epfd, int op, int fd,struct epoll_event* event);
+```
+参数解释：
+- epfd:epoll例程的文件描述符
+- op:增删改监视对象
+
+	- EPOLL_CTL_ADD:把文件描述符注册到epoll例程
+    - EPOLL_CTL_DEL:类似地，删除
+    - EPOLL_CTL_MOD:修改
+- fd:需要注册的文件描述符
+- event: 监视对象的事件类型
+
+```
+有个问题：epoll_event结构体之前不是说用于保存返回的发生变化的文件描述符吗？？
+```
+也可以在注册时用来描述想要关注的事件哦！比如：
+```
+struct epoll_event event;
+...
+event.events=EPOLLIN;
+event.data.fd=sockfd
+//说明关注sockfd发生数据读取的现象
+//注册时用的和后面接受时候用到的不是一个哦，后面wait中用到的需要动态分配内存的！
+EPOLLIN：输入
+EPOLLOUT：输出
+EPOLLPRI：OOB数据
+EPOLLRDHUP：断开链接或者半关闭
+```
+上述参数可以通过按位或来一起用。
+
+```
+int epoll_wait(int epfd,struct epoll_event* events,int maxevents,int timeout);
+```
+- events:发生事件的文件描述符的集合！为啥是集合呢，虽然是个指针，但是指向的集合的首元素？
+- maxevents: 可保存的最大事件数
+- timeout:等待时间
+
+调用成功时返回发生事件的文件描述符个数。用epoll和用select的服务器结构是差不多的：
+
+```
+	epfd=epoll_create(EPOLL_SIZE);
+	ep_events=malloc(sizeof(struct epoll_event)*EPOLL_SIZE);
+
+	event.events=EPOLLIN;
+	event.data.fd=serv_sock;	
+	epoll_ctl(epfd, EPOLL_CTL_ADD, serv_sock, &event);
+
+	while(1)
+	{
+		event_cnt=epoll_wait(epfd, ep_events, EPOLL_SIZE, -1);
+		if(event_cnt==-1)
+		{
+			puts("epoll_wait() error");
+			break;
+		}
+
+		for(i=0; i<event_cnt; i++)
+		{
+			if(ep_events[i].data.fd==serv_sock)
+			{//如果是监测套接字，注册客户端套接字，把新的文件描述符注册进去;
+				adr_sz=sizeof(clnt_adr);
+				clnt_sock=accept(serv_sock, (struct sockaddr*)&clnt_adr, &adr_sz);
+				event.events=EPOLLIN;
+				event.data.fd=clnt_sock;
+				epoll_ctl(epfd, EPOLL_CTL_ADD, clnt_sock, &event);
+				printf("connected client: %d \n", clnt_sock);
+			}
+			else
+			{//否则则说明是客户端的套接字，开始读写；注意这里IO还没分开，可以优化。
+					str_len=read(ep_events[i].data.fd, buf, BUF_SIZE);
+					if(str_len==0)    // close request!
+					{
+						epoll_ctl(
+							epfd, EPOLL_CTL_DEL, ep_events[i].data.fd, NULL);
+						close(ep_events[i].data.fd);
+						printf("closed client: %d \n", ep_events[i].data.fd);
+					}
+					else
+					{
+						write(ep_events[i].data.fd, buf, str_len);    // echo!
+					}
+	
+			}
+		}
+	}
+	close(serv_sock);
+	close(epfd);
+	return 0;
+```
+### 5.2 条件触发和边缘触发
+```
+条件触发模式：只要输入输出缓冲中有数据，就会一直通知该事件
+边缘触发模式：缓冲收到数据时只注册一次该事件；
+```
+epoll默认是条件触发模式工作的。
+
+- 从例子中来看，LT模式下，只要输入缓冲中还有数据，那么就会一直注册新的事件，然后触发event_wait；
+- 而ET模式下，只会注册一次新的事件；因此需要自己循环去read，并且通过read函数返回值errno判断是否读完了。
+- ET模式的好处是可以分离接收数据和处理数据的时间点；也就是说服务端可以决定何时处理
 
 ## 6. 多线程来替代多进程
 
